@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod notify;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -41,6 +42,10 @@ pub struct App {
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    /// Per-node notification state: whether a node is inside its offline grace
+    /// period, and whether the last change has already been reported. Rebuilt
+    /// by a reconnect, hence in memory only. See `notify`.
+    pub notify: Mutex<HashMap<i64, notify::NodeState>>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
@@ -63,6 +68,7 @@ impl App {
             db,
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            notify: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
@@ -398,6 +404,10 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        // The notification card reads and writes a document of its own: `notify`
+        // holds the keys, their defaults and their validation. See `notify`.
+        .route("/api/notify/settings", get(notify::settings).put(notify::save_settings))
+        .route("/api/notify/test", post(notify::notify_test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))

@@ -174,6 +174,9 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // than the machine.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
     info!("node {node_id} connected from {ip}");
+    // Recorded before anything can go wrong with the socket: this is the state
+    // that later tells a short reconnect from an outage. See `notify`.
+    crate::notify::connected(&app, node_id, session);
 
     // Send the probe list before the first report arrives.
     let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
@@ -224,6 +227,10 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 
     if release(&app, node_id, session) {
         info!("node {node_id} went offline");
+        // The grace period starts here, not at the socket's death: a node that
+        // returns inside it was never off, and the notification is cancelled.
+        // A stale teardown released nothing, so it arms nothing either.
+        crate::notify::disconnected(&app, node_id, session);
     }
     outcome
 }
