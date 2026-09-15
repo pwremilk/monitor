@@ -27,8 +27,10 @@ assert.deepEqual(
     "notify_bark_url",
     "notify_enabled",
     "notify_grace_seconds",
+    "notify_javascript_script",
     "notify_notify_on_online",
     "notify_provider",
+    "notify_serverchan_endpoint",
     "notify_telegram_chat",
     "notify_telegram_endpoint",
     "notify_template",
@@ -53,4 +55,12 @@ const edited = notifyPatch({ notify_provider: "bark", notify_enabled: "on", noti
 assert.equal(edited.notify_enabled, "on")
 assert.equal(edited.notify_grace_seconds, "0")
 assert.equal(edited.notify_bark_level, "critical")
+// 操作者刚敲进去的密钥由面板单独保管：保存成功后清空，下一次保存不该再把上一把
+// 密钥传一遍——面板手里只有「已设置」这一个布尔，它无从判断那还是不是同一把。
+assert.equal(notifyPatch({}, { notify_telegram_token: "123:ABC" }).notify_telegram_token, "123:ABC")
+assert.equal(notifyPatch({}, { notify_telegram_token: "  " }).notify_telegram_token, undefined)
+assert.equal(notifyPatch({ notify_bark_key: "old" }, {}).notify_bark_key, "old")
+assert.equal(notifyPatch({ notify_bark_key: "old" }, { notify_bark_key: "new" }).notify_bark_key, "new")
+// URL 也是密钥：一次保存后它同样只留在 hub 那边。
+assert.equal(notifyPatch({}, { notify_webhook_url: "https://hook.example.com/x" }).notify_webhook_url, "https://hook.example.com/x")
 console.log("partial edits, traffic corrections, provisioning checks and notification patches passed")

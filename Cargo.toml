@@ -31,6 +31,11 @@ tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# The JavaScript notification channel. Pure Rust, like the two above, and the
+# same `FROM scratch` constraint rules out the Node compatibility layer komari
+# builds on goja_nodejs. Default features off: `temporal` and `intl` would pull
+# in the ICU data crates for two globals a notification script has no use for.
+boa_engine = { version = "0.22.0", default-features = false }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

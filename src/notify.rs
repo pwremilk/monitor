@@ -35,7 +35,7 @@ use crate::{App, Shared};
 /// Every setting this subsystem reads or writes, the one vocabulary the reader,
 /// the write path and the panel all check against: a key spelled differently in
 /// two of the three is a setting that silently does nothing.
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 19] = [
     "notify_enabled",
     "notify_provider",
     "notify_notify_on_online",
@@ -53,6 +53,8 @@ pub const KEYS: [&str; 17] = [
     "notify_bark_key",
     "notify_bark_level",
     "notify_serverchan_key",
+    "notify_serverchan_endpoint",
+    "notify_javascript_script",
 ];
 
 /// The keys holding a credential. Write-only, as `github_client_secret` is:
@@ -77,12 +79,17 @@ const MAX_GRACE_SECONDS: i64 = 86_400;
 const DEFAULT_TELEGRAM_ENDPOINT: &str = "https://api.telegram.org/bot";
 const DEFAULT_BARK_URL: &str = "https://api.day.app";
 
-/// Where ServerChan is reached. Not configurable: the sendkey is the whole
-/// credential and the host is fixed by the service.
-const SERVERCHAN_ENDPOINT: &str = "https://sctapi.ftqq.com";
+/// Where ServerChan is reached by default. Configurable since the reference
+/// implementation takes a complete interface address: a self-hosted mirror, and
+/// any end-to-end test of this channel, needs somewhere else to send to.
+const DEFAULT_SERVERCHAN_ENDPOINT: &str = "https://sctapi.ftqq.com";
 
 /// The levels a Bark push may carry, from the Bark app's own vocabulary.
 const BARK_LEVELS: [&str; 4] = ["active", "timeSensitive", "passive", "critical"];
+
+/// The methods a webhook may use. The write path and the reader both check
+/// against this pair, and it is the same pair the request builder understands.
+const WEBHOOK_METHODS: [&str; 2] = ["GET", "POST"];
 
 // ---- the event ----
 
@@ -206,6 +213,8 @@ pub enum Provider {
     Telegram,
     Bark,
     ServerChan,
+    /// An operator's own script, run in the embedded engine. See `notify_js`.
+    JavaScript,
 }
 
 impl Provider {
@@ -216,6 +225,7 @@ impl Provider {
             "telegram" => Self::Telegram,
             "bark" => Self::Bark,
             "serverchan" => Self::ServerChan,
+            "javascript" => Self::JavaScript,
             _ => return None,
         })
     }
@@ -227,6 +237,7 @@ impl Provider {
             Self::Telegram => "telegram",
             Self::Bark => "bark",
             Self::ServerChan => "serverchan",
+            Self::JavaScript => "javascript",
         }
     }
 }
@@ -254,6 +265,11 @@ pub struct Config {
     pub bark_key: String,
     pub bark_level: String,
     pub serverchan_key: String,
+    pub serverchan_endpoint: String,
+    /// The JavaScript channel's program, as the operator wrote it. Empty means
+    /// the channel has nothing to run, which is reported like any other
+    /// unconfigured channel rather than silently succeeding.
+    pub javascript_script: String,
 }
 
 impl Config {
@@ -282,9 +298,11 @@ impl Config {
             grace_seconds: grace_seconds(&text("notify_grace_seconds")),
             template: or_default("notify_template", DEFAULT_TEMPLATE),
             webhook_url: text("notify_webhook_url"),
-            // Upper case, so `post` written by hand still matches the panel's
-            // select and the comparison below.
-            webhook_method: or_default("notify_webhook_method", "POST").to_ascii_uppercase(),
+            // Out of the vocabulary the writer and the request builder both
+            // understand, so a `post`, a `patch` or anything else lands on POST
+            // instead of coming back to the panel as a value that cannot be
+            // saved. `deliver` picks POST for everything but GET either way.
+            webhook_method: one_of(&text("notify_webhook_method"), &WEBHOOK_METHODS, "POST"),
             webhook_headers: text("notify_webhook_headers"),
             webhook_username: text("notify_webhook_username"),
             webhook_password: text("notify_webhook_password"),
@@ -293,8 +311,13 @@ impl Config {
             telegram_endpoint: or_default("notify_telegram_endpoint", DEFAULT_TELEGRAM_ENDPOINT),
             bark_url: or_default("notify_bark_url", DEFAULT_BARK_URL),
             bark_key: text("notify_bark_key"),
-            bark_level: text("notify_bark_level"),
+            // The app's four levels or nothing at all: a stored value outside
+            // them is one no push should carry, and one the panel's select
+            // cannot even display.
+            bark_level: one_of(&text("notify_bark_level"), &BARK_LEVELS, ""),
             serverchan_key: text("notify_serverchan_key"),
+            serverchan_endpoint: or_default("notify_serverchan_endpoint", DEFAULT_SERVERCHAN_ENDPOINT),
+            javascript_script: text("notify_javascript_script"),
         }
     }
 
@@ -320,6 +343,8 @@ impl Config {
             ("notify_telegram_endpoint", self.telegram_endpoint.clone()),
             ("notify_bark_url", self.bark_url.clone()),
             ("notify_bark_level", self.bark_level.clone()),
+            ("notify_serverchan_endpoint", self.serverchan_endpoint.clone()),
+            ("notify_javascript_script", self.javascript_script.clone()),
         ]
     }
 }
@@ -337,6 +362,24 @@ fn grace_seconds(value: &str) -> i64 {
     value.trim().parse::<i64>().map_or(DEFAULT_GRACE_SECONDS, |s| s.clamp(0, MAX_GRACE_SECONDS))
 }
 
+/// Reads a setting whose value has to come from a fixed list, falling back to
+/// `default` for anything outside it.
+///
+/// The reader's output is what the panel shows and echoes back on the next save,
+/// so a stored value the write path refuses is not merely a display problem: the
+/// whole card becomes unsavable, and the operator meets a 400 naming a field they
+/// never touched. Rows can arrive from a hand edit, an older hub or another
+/// implementation, which is exactly why the reader has to answer with something
+/// the writer accepts. The list's own spelling wins, so `post` reads back as
+/// `POST` whether or not the row was written by the panel.
+fn one_of(value: &str, allowed: &[&str], default: &str) -> String {
+    let value = value.trim();
+    allowed
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(value))
+        .map_or_else(|| default.to_owned(), |found| (*found).to_owned())
+}
+
 /// Why one notification setting cannot be stored, or `None` when it can.
 ///
 /// Beside the reader rather than in the handler, so a value that cannot be used
@@ -349,9 +392,10 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
         "notify_enabled" | "notify_notify_on_online" if !matches!(value, "on" | "off") => {
             Some(format!("{key} must be on or off"))
         }
-        "notify_provider" if Provider::parse(value).is_none() => {
-            Some("the notification channel must be one of none, webhook, telegram, bark, serverchan".into())
-        }
+        "notify_provider" if Provider::parse(value).is_none() => Some(
+            "the notification channel must be one of none, webhook, telegram, bark, serverchan, javascript"
+                .into(),
+        ),
         "notify_grace_seconds"
             if !value.trim().parse::<i64>().is_ok_and(|s| (0..=MAX_GRACE_SECONDS).contains(&s)) =>
         {
@@ -359,15 +403,15 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
         }
         "notify_webhook_method"
             if !(value.trim().is_empty()
-                || value.trim().eq_ignore_ascii_case("get")
-                || value.trim().eq_ignore_ascii_case("post")) =>
+                || WEBHOOK_METHODS.iter().any(|method| method.eq_ignore_ascii_case(value.trim()))) =>
         {
             Some("the webhook method must be GET or POST".into())
         }
         "notify_webhook_headers" => parse_headers(value).err().map(|e| format!("{e:#}")),
-        "notify_webhook_url" | "notify_telegram_endpoint" | "notify_bark_url" => {
-            url_error(value).map(str::to_owned)
-        }
+        "notify_webhook_url"
+        | "notify_telegram_endpoint"
+        | "notify_bark_url"
+        | "notify_serverchan_endpoint" => url_error(value).map(str::to_owned),
         "notify_bark_level" if !(value.trim().is_empty() || BARK_LEVELS.contains(&value.trim())) => {
             Some(format!("the Bark level must be empty or one of {}", BARK_LEVELS.join(", ")))
         }
@@ -479,6 +523,10 @@ async fn deliver(http: &Client, config: &Config, event: &EventMessage) -> Result
         Provider::Telegram => telegram(http, config, event).await,
         Provider::Bark => bark(http, config, event).await,
         Provider::ServerChan => serverchan(http, config, event).await,
+        // The only channel that runs code rather than building a request, so it
+        // lives in its own module: the engine, the limits it runs under and the
+        // bridge to `fetch` are all its own business. See `notify_js`.
+        Provider::JavaScript => crate::notify_js::send(http, config, event).await,
     }
 }
 
@@ -515,13 +563,15 @@ fn truncate(body: &str) -> String {
     }
 }
 
-/// What a POST webhook receives.
+/// What a POST webhook receives, and the object a JavaScript channel's
+/// `sendEvent` is handed.
 ///
-/// The field names are the template's, so an operator who has already wired up
-/// an endpoint for one of these hubs does not meet a second vocabulary. `time`
-/// is the readable one the notification shows; `timestamp` is the same instant
-/// for anything automated.
-fn webhook_body(event: &EventMessage) -> Value {
+/// One builder for both, so the fields an operator's own script reads are the
+/// ones their webhook already receives. The names are the template's, so an
+/// operator who has already wired up an endpoint for one of these hubs does not
+/// meet a second vocabulary. `time` is the readable one the notification shows;
+/// `timestamp` is the same instant for anything automated.
+pub(crate) fn event_object(event: &EventMessage) -> Value {
     json!({
         "event": event.event.as_str(),
         "title": event.event.as_str(),
@@ -559,7 +609,7 @@ fn webhook_request(http: &Client, config: &Config, event: &EventMessage) -> Resu
     } else {
         // A POST when the method is empty or unreadable: it carries a body, and
         // the alternative silently drops the event into a query string.
-        http.post(config.webhook_url.trim()).json(&webhook_body(event))
+        http.post(config.webhook_url.trim()).json(&event_object(event))
     };
     for (name, value) in parse_headers(&config.webhook_headers)? {
         request = request.header(name, value);
@@ -676,7 +726,11 @@ async fn serverchan(http: &Client, config: &Config, event: &EventMessage) -> Res
     if config.serverchan_key.trim().is_empty() {
         anyhow::bail!("the ServerChan sendkey is not configured");
     }
-    let url = format!("{}/{}.send", SERVERCHAN_ENDPOINT, config.serverchan_key.trim());
+    let url = format!(
+        "{}/{}.send",
+        base_url(&config.serverchan_endpoint, DEFAULT_SERVERCHAN_ENDPOINT),
+        config.serverchan_key.trim()
+    );
     let response = http
         .post(url)
         .form(&[("title", event.event.as_str()), ("desp", render(&config.template, event).as_str())])
@@ -1059,11 +1113,57 @@ mod tests {
         assert_eq!(Config::load(stored("notify_webhook_method", "post")).webhook_method, "POST");
     }
 
+    /// Every value the reader hands the panel is one the write path accepts --
+    /// for a row edited by hand as much as for a fresh hub.
+    ///
+    /// The panel shows what the reader returned and echoes it back on the next
+    /// save, so a value the writer refuses makes the whole card unsavable: the
+    /// operator meets a 400 naming a field they never touched, and every other
+    /// edit on that card is lost with it.
+    #[test]
+    fn every_value_the_reader_hands_the_panel_is_one_the_writer_accepts() {
+        let hand_edited = [
+            // The two a hand edit can push outside their vocabulary.
+            ("notify_bark_level", "loud"),
+            ("notify_webhook_method", "PATCH"),
+            // And the ones a hand edit only makes untidy or stale.
+            ("notify_webhook_method", "post"),
+            ("notify_telegram_endpoint", "https://api.telegram.org/bot/ "),
+            ("notify_bark_url", "https://api.day.app/"),
+            ("notify_grace_seconds", "999999"),
+            ("notify_provider", "sms"),
+            ("notify_webhook_headers", "{}"),
+            ("notify_template", "  "),
+            ("notify_serverchan_endpoint", "https://sctapi.ftqq.com/"),
+            ("notify_webhook_url", "http://192.168.1.9:8080/push"),
+            ("notify_javascript_script", "function sendMessage() {}"),
+        ];
+        for (key, value) in hand_edited {
+            for (read_key, read_value) in Config::load(stored(key, value)).readable() {
+                assert!(
+                    setting_error(read_key, &read_value).is_none(),
+                    "{key}={value:?} reads back as {read_key}={read_value:?}, which the same card cannot save"
+                );
+            }
+        }
+        // The reader's answer for the two closed vocabularies, spelled the way
+        // the rest of the hub spells it.
+        assert_eq!(Config::load(stored("notify_bark_level", "loud")).bark_level, "");
+        assert_eq!(Config::load(stored("notify_bark_level", "timesensitive")).bark_level, "timeSensitive");
+        assert_eq!(Config::load(stored("notify_webhook_method", "PATCH")).webhook_method, "POST");
+        assert_eq!(Config::load(stored("notify_webhook_method", "get")).webhook_method, "GET");
+    }
+
     #[test]
     fn an_unknown_channel_is_refused_rather_than_quietly_mapped_onto_one() {
-        for provider in
-            [Provider::None, Provider::Webhook, Provider::Telegram, Provider::Bark, Provider::ServerChan]
-        {
+        for provider in [
+            Provider::None,
+            Provider::Webhook,
+            Provider::Telegram,
+            Provider::Bark,
+            Provider::ServerChan,
+            Provider::JavaScript,
+        ] {
             assert_eq!(Provider::parse(provider.as_str()), Some(provider), "{}", provider.as_str());
         }
         assert_eq!(Provider::parse("Webhook"), None, "the panel's values are the only ones");
@@ -1098,6 +1198,17 @@ mod tests {
         }
         assert!(setting_error("notify_telegram_endpoint", "api.telegram.org").is_some());
         assert!(setting_error("notify_bark_url", "https://api.day.app").is_none());
+        // The ServerChan interface address, validated like the other two: a
+        // self-hosted mirror or a test double is an ordinary deployment.
+        assert!(setting_error("notify_serverchan_endpoint", "https://sctapi.ftqq.com").is_none());
+        assert!(setting_error("notify_serverchan_endpoint", "").is_none());
+        assert!(setting_error("notify_serverchan_endpoint", "sctapi.ftqq.com").is_some());
+        assert!(setting_error("notify_serverchan_endpoint", "ftp://sct.example.com").is_some());
+        // The JavaScript channel: the provider name, and a script that is free
+        // text -- what it says is checked by running it, not by looking at it.
+        assert!(setting_error("notify_provider", "javascript").is_none());
+        assert!(setting_error("notify_javascript_script", "function sendMessage() {}").is_none());
+        assert!(setting_error("notify_javascript_script", "").is_none());
         // Headers have to be a JSON object of strings.
         for bad in ["[1]", "{\"x\": 1}", "{", "{\"X Token\": \"a\"}"] {
             assert!(setting_error("notify_webhook_headers", bad).is_some(), "{bad:?}");
@@ -1386,6 +1497,10 @@ mod tests {
         assert_eq!(read["notify_webhook_method"], "POST");
         assert_eq!(read["notify_telegram_endpoint"], "https://api.telegram.org/bot");
         assert_eq!(read["notify_bark_url"], "https://api.day.app");
+        assert_eq!(read["notify_serverchan_endpoint"], "https://sctapi.ftqq.com");
+        // The script is the operator's text and travels both ways: a form that
+        // could not read its own channel back would erase it on the next save.
+        assert_eq!(read["notify_javascript_script"], "");
         assert!(read["notify_template"].as_str().unwrap().contains("{{node}}"));
         assert_eq!(read["notify_telegram_token_set"], true);
         assert_eq!(read["notify_bark_key_set"], true);
@@ -1398,7 +1513,7 @@ mod tests {
             .iter()
             .filter_map(|key| read.get(key).map(|value| ((*key).to_owned(), value.clone())))
             .collect();
-        assert_eq!(echoed.len(), 12, "each readable key, and none of the credentials");
+        assert_eq!(echoed.len(), 14, "each readable key, and none of the credentials");
         echoed.insert("notify_provider".into(), json!("bark"));
         echoed.insert("notify_bark_level".into(), json!("critical"));
 
