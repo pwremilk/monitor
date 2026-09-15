@@ -1249,6 +1249,7 @@ const NOTIFY_PROVIDERS: [string, string][] = [
   ["telegram", "Telegram"],
   ["bark", "Bark"],
   ["serverchan", "Server酱"],
+  ["javascript", "JavaScript 脚本"],
 ]
 // Bark 的级别取值。「默认」在库里是空字符串，但 Radix 的 Select 不接受空字符串
 // 的 item，所以这里用一个哨兵值，两侧转换只在这张表和下面那行上。
@@ -1260,6 +1261,10 @@ const BARK_LEVELS: [string, string][] = [
   ["critical", "critical"],
 ]
 
+// 模板和脚本都是要按行读的文本，共用一套等宽样式；高度在调用处给。
+const TEXTAREA =
+  "w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs transition-[color,box-shadow] outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+
 /**
  * 「通知」卡片。字段按选中的渠道显示：一个 hub 只会用其中一组，把五组一起摆
  * 出来只会让人以为自己漏填了什么。
@@ -1270,6 +1275,9 @@ const BARK_LEVELS: [string, string][] = [
  */
 function Notifications() {
   const [s, setS] = useState<Settings | null>(null)
+  // 密钥不在 `s` 里：`s` 是 hub 那份文档，而密钥永远读不回来。操作者刚敲进去的
+  // 明文单独放这里，保存成功后清空，下一次保存就不会把上一次的密钥再传一遍。
+  const [secrets, setSecrets] = useState<Record<string, string>>({})
   const [testing, setTesting] = useState(false)
   useEffect(() => {
     api<Settings>("/notify/settings").then(setS).catch((e) => toast.error((e as Error).message))
@@ -1277,6 +1285,7 @@ function Notifications() {
   if (!s) return null
 
   const set = (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v }))
+  const setSecret = (k: string, v: string) => setSecrets((old) => ({ ...old, [k]: v }))
   const provider = String(s.notify_provider || "none")
   // 密钥只写不可读，面板只有「已设置」这一个布尔。留空即不改，见 notifyPatch。
   const secretHint = (alreadySet: boolean) => (alreadySet ? "已设置，留空不变" : "未设置")
@@ -1285,7 +1294,11 @@ function Notifications() {
     try {
       // `s ?? {}`: the guard above narrows `s` for the JSX below, but not inside
       // this closure, and the body has to stay a valid `notifyPatch` input.
-      await api("/notify/settings", { method: "PUT", body: JSON.stringify(notifyPatch(s ?? {})) })
+      await api("/notify/settings", { method: "PUT", body: JSON.stringify(notifyPatch(s ?? {}, secrets)) })
+      // 回读一次，而不是就这么算了：`_set` 标志是保存后才变的，不回读面板会一直说
+      // 「未设置」，而刚存进去的密钥还留在输入框和 state 里，下一次保存再传一遍。
+      setS(await api<Settings>("/notify/settings"))
+      setSecrets({})
       toast.success("已保存")
     } catch (e) {
       toast.error((e as Error).message)
@@ -1355,8 +1368,9 @@ function Notifications() {
           <Field label="Webhook 地址" hint={secretHint(!!s.notify_webhook_url_set)} className="sm:col-span-2">
             <Input
               type="password"
+              value={secrets.notify_webhook_url ?? ""}
               placeholder={s.notify_webhook_url_set ? "••••••••" : "https://example.com/hook"}
-              onChange={(e) => set("notify_webhook_url", e.target.value)}
+              onChange={(e) => setSecret("notify_webhook_url", e.target.value)}
             />
           </Field>
           <Field label="请求方法">
@@ -1381,8 +1395,9 @@ function Notifications() {
           <Field label="Basic 认证密码" hint={secretHint(!!s.notify_webhook_password_set)}>
             <Input
               type="password"
+              value={secrets.notify_webhook_password ?? ""}
               placeholder={s.notify_webhook_password_set ? "••••••••" : ""}
-              onChange={(e) => set("notify_webhook_password", e.target.value)}
+              onChange={(e) => setSecret("notify_webhook_password", e.target.value)}
             />
           </Field>
         </div>
@@ -1393,8 +1408,9 @@ function Notifications() {
           <Field label="Bot Token" hint={secretHint(!!s.notify_telegram_token_set)}>
             <Input
               type="password"
+              value={secrets.notify_telegram_token ?? ""}
               placeholder={s.notify_telegram_token_set ? "••••••••" : "123456:ABC-DEF…"}
-              onChange={(e) => set("notify_telegram_token", e.target.value)}
+              onChange={(e) => setSecret("notify_telegram_token", e.target.value)}
             />
           </Field>
           <Field label="Chat ID" hint="私聊或群组的 id，例如 -1001234567890">
@@ -1415,8 +1431,9 @@ function Notifications() {
           <Field label="设备 Key" hint={secretHint(!!s.notify_bark_key_set)}>
             <Input
               type="password"
+              value={secrets.notify_bark_key ?? ""}
               placeholder={s.notify_bark_key_set ? "••••••••" : "Bark App 里的一串 key"}
-              onChange={(e) => set("notify_bark_key", e.target.value)}
+              onChange={(e) => setSecret("notify_bark_key", e.target.value)}
             />
           </Field>
           <Field label="推送级别">
@@ -1441,11 +1458,36 @@ function Notifications() {
       )}
 
       {provider === "serverchan" && (
-        <Field label="SendKey" hint={secretHint(!!s.notify_serverchan_key_set)}>
-          <Input
-            type="password"
-            placeholder={s.notify_serverchan_key_set ? "••••••••" : "SCT…"}
-            onChange={(e) => set("notify_serverchan_key", e.target.value)}
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="SendKey" hint={secretHint(!!s.notify_serverchan_key_set)}>
+            <Input
+              type="password"
+              value={secrets.notify_serverchan_key ?? ""}
+              placeholder={s.notify_serverchan_key_set ? "••••••••" : "SCT…"}
+              onChange={(e) => setSecret("notify_serverchan_key", e.target.value)}
+            />
+          </Field>
+          <Field label="接口地址" hint="默认官方地址，自建或镜像时改这里；发送走 {地址}/{SendKey}.send">
+            <Input
+              value={String(s.notify_serverchan_endpoint ?? "")}
+              onChange={(e) => set("notify_serverchan_endpoint", e.target.value)}
+              placeholder="https://sctapi.ftqq.com"
+            />
+          </Field>
+        </div>
+      )}
+
+      {provider === "javascript" && (
+        <Field
+          label="脚本"
+          hint="必须定义 sendMessage(message, title)；定义了 sendEvent(event) 则优先调用它。可用 fetch(url, {method, headers, body})（同步返回 {status, ok, body}）和 console.log/warn/error；没有 require、fs、crypto、process、setTimeout。脚本有循环与递归上限，超时会被当作发送失败。"
+        >
+          <textarea
+            className={`min-h-40 ${TEXTAREA}`}
+            spellCheck={false}
+            value={String(s.notify_javascript_script ?? "")}
+            onChange={(e) => set("notify_javascript_script", e.target.value)}
+            placeholder={'function sendMessage(message, title) {\n  fetch("https://example.com/hook", { method: "POST", body: JSON.stringify({ message, title }) })\n}'}
           />
         </Field>
       )}
@@ -1455,7 +1497,7 @@ function Notifications() {
         hint="占位符：{{event}} {{node}} {{message}} {{time}} {{emoji}}；未知占位符原样保留"
       >
         <textarea
-          className="min-h-24 w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs transition-[color,box-shadow] outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+          className={`min-h-24 ${TEXTAREA}`}
           value={String(s.notify_template ?? "")}
           onChange={(e) => set("notify_template", e.target.value)}
         />
