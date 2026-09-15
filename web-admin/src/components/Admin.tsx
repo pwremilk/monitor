@@ -1480,7 +1480,7 @@ function Notifications() {
       {provider === "javascript" && (
         <Field
           label="脚本"
-          hint="必须定义 sendMessage(message, title)；定义了 sendEvent(event) 则优先调用它。可用 fetch(url, {method, headers, body})（同步返回 {status, ok, body}）和 console.log/warn/error；没有 require、fs、crypto、process、setTimeout。脚本有循环与递归上限，超时会被当作发送失败。"
+          hint="必须定义 sendMessage(message, title)；定义了 sendEvent(event) 则优先调用它。可用 fetch(url, {method, headers, body})（同步返回 {status, ok, body}）、console、定时器、atob/btoa、Buffer、crypto（sha1/sha224/sha256/sha384/sha512 摘要与 HMAC）、process，以及 require 的 node:path / node:os / node:util / node:crypto / node:buffer（后两个就是全局 crypto 和 Buffer，带不带 node: 前缀都行）；没有 fs、child_process、net、http 和 import。未清掉的 interval 会一直跑到 20 秒预算耗尽，CPU 死循环约 3 秒被判失败。"
         >
           <textarea
             className={`min-h-40 ${TEXTAREA}`}
