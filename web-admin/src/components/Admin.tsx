@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
+import { api, changes, GIB, notifyPatch, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1236,7 +1236,240 @@ function SettingsTab() {
           </Button>
         </div>
       </Card>
+      <Notifications />
     </div>
+  )
+}
+
+// 渠道与它们的字段，和服务端 notify.rs 的枚举、键名一一对应。写成表而不是散在
+// JSX 里，是因为「选了哪个渠道」决定了下面显示哪些字段。
+const NOTIFY_PROVIDERS: [string, string][] = [
+  ["none", "不通知"],
+  ["webhook", "Webhook"],
+  ["telegram", "Telegram"],
+  ["bark", "Bark"],
+  ["serverchan", "Server酱"],
+]
+// Bark 的级别取值。「默认」在库里是空字符串，但 Radix 的 Select 不接受空字符串
+// 的 item，所以这里用一个哨兵值，两侧转换只在这张表和下面那行上。
+const BARK_LEVELS: [string, string][] = [
+  ["default", "默认"],
+  ["active", "active"],
+  ["timeSensitive", "timeSensitive"],
+  ["passive", "passive"],
+  ["critical", "critical"],
+]
+
+/**
+ * 「通知」卡片。字段按选中的渠道显示：一个 hub 只会用其中一组，把五组一起摆
+ * 出来只会让人以为自己漏填了什么。
+ *
+ * 设置自己从 `/api/notify/settings` 读写，不搭 `useSettings()` 的 `/api/settings`：
+ * 这些键、它们的默认值和校验都在服务端 notify 模块里，自成一份文档；混进站点设置
+ * 就变成「服务端给什么」和「面板回传什么」两份需要对齐、又各自演化的列表。
+ */
+function Notifications() {
+  const [s, setS] = useState<Settings | null>(null)
+  const [testing, setTesting] = useState(false)
+  useEffect(() => {
+    api<Settings>("/notify/settings").then(setS).catch((e) => toast.error((e as Error).message))
+  }, [])
+  if (!s) return null
+
+  const set = (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v }))
+  const provider = String(s.notify_provider || "none")
+  // 密钥只写不可读，面板只有「已设置」这一个布尔。留空即不改，见 notifyPatch。
+  const secretHint = (alreadySet: boolean) => (alreadySet ? "已设置，留空不变" : "未设置")
+
+  async function save() {
+    try {
+      // `s ?? {}`: the guard above narrows `s` for the JSX below, but not inside
+      // this closure, and the body has to stay a valid `notifyPatch` input.
+      await api("/notify/settings", { method: "PUT", body: JSON.stringify(notifyPatch(s ?? {})) })
+      toast.success("已保存")
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
+  async function test() {
+    setTesting(true)
+    try {
+      await api("/notify/test", { method: "POST" })
+      toast.success("测试通知已发出，渠道正常的话马上就能收到")
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Card className="gap-4 p-5">
+      <div>
+        <h3 className="text-sm font-medium">通知</h3>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          节点离线超过宽限期、以及之后重新上线时推送一条消息。密钥只写不可读，面板不会回显原文。
+        </p>
+      </div>
+
+      {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。 */}
+      <div className="flex items-center gap-2 text-sm">
+        <Switch
+          aria-labelledby="notify-enabled-label"
+          checked={s.notify_enabled === "on"}
+          onCheckedChange={(v) => set("notify_enabled", v ? "on" : "off")}
+        />
+        <span id="notify-enabled-label">启用通知</span>
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="通知渠道">
+          <Select value={provider} onValueChange={(v) => set("notify_provider", v)}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {NOTIFY_PROVIDERS.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field label="离线宽限期（秒）" hint="断线后等这么久仍然没回来才发离线通知；期间重连视为抖动，不发通知">
+          <Input
+            type="number"
+            value={String(s.notify_grace_seconds ?? "300")}
+            onChange={(e) => set("notify_grace_seconds", e.target.value)}
+          />
+        </Field>
+      </div>
+
+      <div className="flex items-center gap-2 text-sm">
+        <Switch
+          aria-labelledby="notify-online-label"
+          checked={s.notify_notify_on_online !== "off"}
+          onCheckedChange={(v) => set("notify_notify_on_online", v ? "on" : "off")}
+        />
+        <span id="notify-online-label">节点重新上线时也通知</span>
+      </div>
+
+      {provider === "webhook" && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Webhook 地址" hint={secretHint(!!s.notify_webhook_url_set)} className="sm:col-span-2">
+            <Input
+              type="password"
+              placeholder={s.notify_webhook_url_set ? "••••••••" : "https://example.com/hook"}
+              onChange={(e) => set("notify_webhook_url", e.target.value)}
+            />
+          </Field>
+          <Field label="请求方法">
+            <Select value={String(s.notify_webhook_method || "POST")} onValueChange={(v) => set("notify_webhook_method", v)}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="POST">POST（JSON body）</SelectItem>
+                <SelectItem value="GET">GET（参数拼在 URL 上）</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="自定义请求头" hint="JSON 对象，值为字符串；空对象或留空表示不加头">
+            <Input
+              value={String(s.notify_webhook_headers ?? "")}
+              onChange={(e) => set("notify_webhook_headers", e.target.value)}
+              placeholder='{"Authorization": "Bearer …"}'
+            />
+          </Field>
+          <Field label="Basic 认证用户名" hint="留空则不发送认证头">
+            <Input value={String(s.notify_webhook_username ?? "")} onChange={(e) => set("notify_webhook_username", e.target.value)} />
+          </Field>
+          <Field label="Basic 认证密码" hint={secretHint(!!s.notify_webhook_password_set)}>
+            <Input
+              type="password"
+              placeholder={s.notify_webhook_password_set ? "••••••••" : ""}
+              onChange={(e) => set("notify_webhook_password", e.target.value)}
+            />
+          </Field>
+        </div>
+      )}
+
+      {provider === "telegram" && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Bot Token" hint={secretHint(!!s.notify_telegram_token_set)}>
+            <Input
+              type="password"
+              placeholder={s.notify_telegram_token_set ? "••••••••" : "123456:ABC-DEF…"}
+              onChange={(e) => set("notify_telegram_token", e.target.value)}
+            />
+          </Field>
+          <Field label="Chat ID" hint="私聊或群组的 id，例如 -1001234567890">
+            <Input value={String(s.notify_telegram_chat ?? "")} onChange={(e) => set("notify_telegram_chat", e.target.value)} />
+          </Field>
+          <Field label="API 地址" hint="默认官方地址；自建或反代时改这里" className="sm:col-span-2">
+            <Input
+              value={String(s.notify_telegram_endpoint ?? "")}
+              onChange={(e) => set("notify_telegram_endpoint", e.target.value)}
+              placeholder="https://api.telegram.org/bot"
+            />
+          </Field>
+        </div>
+      )}
+
+      {provider === "bark" && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="设备 Key" hint={secretHint(!!s.notify_bark_key_set)}>
+            <Input
+              type="password"
+              placeholder={s.notify_bark_key_set ? "••••••••" : "Bark App 里的一串 key"}
+              onChange={(e) => set("notify_bark_key", e.target.value)}
+            />
+          </Field>
+          <Field label="推送级别">
+            <Select
+              value={String(s.notify_bark_level || "default")}
+              onValueChange={(v) => set("notify_bark_level", v === "default" ? "" : v)}
+            >
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {BARK_LEVELS.map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="服务器地址" hint="默认 https://api.day.app，自建时填自己的地址" className="sm:col-span-2">
+            <Input
+              value={String(s.notify_bark_url ?? "")}
+              onChange={(e) => set("notify_bark_url", e.target.value)}
+              placeholder="https://api.day.app"
+            />
+          </Field>
+        </div>
+      )}
+
+      {provider === "serverchan" && (
+        <Field label="SendKey" hint={secretHint(!!s.notify_serverchan_key_set)}>
+          <Input
+            type="password"
+            placeholder={s.notify_serverchan_key_set ? "••••••••" : "SCT…"}
+            onChange={(e) => set("notify_serverchan_key", e.target.value)}
+          />
+        </Field>
+      )}
+
+      <Field
+        label="通知模板"
+        hint="占位符：{{event}} {{node}} {{message}} {{time}} {{emoji}}；未知占位符原样保留"
+      >
+        <textarea
+          className="min-h-24 w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs transition-[color,box-shadow] outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+          value={String(s.notify_template ?? "")}
+          onChange={(e) => set("notify_template", e.target.value)}
+        />
+      </Field>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button size="sm" onClick={save}>保存通知设置</Button>
+        {/* 渠道选了「不通知」时按钮没有意义：服务端会拒绝，这里先拦住。 */}
+        <Button size="sm" variant="outline" disabled={testing || provider === "none"} onClick={test}>
+          {testing ? "发送中…" : "发送测试通知"}
+        </Button>
+        {provider === "none" && <span className="text-xs text-muted-foreground">先选一个渠道再测试</span>}
+      </div>
+    </Card>
   )
 }
 
