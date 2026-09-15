@@ -763,8 +763,10 @@ async fn serverchan(http: &Client, config: &Config, event: &EventMessage) -> Res
 /// notification could describe accurately.
 #[derive(Debug, Clone)]
 pub struct NodeState {
-    /// The session holding this node, as `agent_ws::SESSION` numbers them. A
-    /// teardown arriving after a reconnect carries the older value.
+    /// The session this state attributes the node to: the last one `connect`
+    /// saw, or, once a teardown has armed the grace period, the session whose
+    /// absence armed it. Numbered from `agent_ws::FIRST_SESSION`, so 0 is a node
+    /// the hub has never met.
     pub connection_id: u64,
     /// The node has connected since the hub started. Its first connection is
     /// the hub meeting the node, not the node coming back.
@@ -822,28 +824,53 @@ impl NodeState {
 
     /// Starts the grace period for a node that has gone, reporting whether this
     /// teardown is the one that owns it.
+    ///
+    /// The session is recorded rather than compared against the one `connect`
+    /// last saw. Two sockets on one node can end in either order -- the newer
+    /// one can go first, with the socket it replaced still reporting -- and the
+    /// caller reports a teardown only once the node's last session has ended
+    /// (see `agent_ws::release`), so the number arriving here is not always the
+    /// newest. Comparing would drop the notification for a node that is
+    /// genuinely gone. What such a comparison protected -- a node that is
+    /// reporting again -- is decided in `disconnected` against the node's live
+    /// entry, which is what the reconnect installs before this state is asked
+    /// anything.
+    ///
+    /// The number is recorded by the teardown that arms the period and by no
+    /// other. A teardown that finds one already running belongs to a different
+    /// session -- the report of a socket the node's departure left behind --
+    /// and taking the period over would leave it attributed to a session no
+    /// task is waiting to ask about: `offline_due` for the session that armed
+    /// it would then refuse a period that is genuinely owed. See the test
+    /// `a_stale_teardown_leaves_a_running_grace_period_to_the_session_that_armed_it`.
     pub fn disconnect(&mut self, connection_id: u64, now: DateTime<Utc>) -> bool {
-        let ours = connection_id == self.connection_id;
-        // A newer session is holding the node. This teardown is late news, and
-        // must not disturb the state that session established: clearing it
-        // would mark a reporting node offline.
-        let armed = ours && self.pending_offline_since.is_none();
-        if armed {
-            self.pending_offline_since = Some(now);
+        // One period per absence: a second teardown for the same node finds one
+        // already running, and adding to it would only move the deadline.
+        if self.pending_offline_since.is_some() {
+            return false;
         }
-        armed
+        self.connection_id = connection_id;
+        self.pending_offline_since = Some(now);
+        true
     }
 
     /// The grace period has elapsed: reports whether the offline notification
     /// is still owed, marking the node offline when it is.
     ///
-    /// `false` means the node returned during the grace period, or a newer
-    /// session took over, and there is nothing to send.
+    /// `false` means the node returned during the grace period, or the period
+    /// belongs to a session this question is not about, and there is nothing to
+    /// send.
+    ///
+    /// Either way the period is settled here, which is why the pending instant
+    /// is taken before anything can refuse it. One left behind is left behind
+    /// for good: `connect` would swallow it and report the node not at all,
+    /// `disconnect` would arm nothing further, and the node would never be
+    /// reported again. A question that has been asked is an answer.
     pub fn offline_due(&mut self, connection_id: u64) -> bool {
-        if connection_id != self.connection_id {
+        if self.pending_offline_since.take().is_none() {
             return false;
         }
-        if self.pending_offline_since.take().is_none() {
+        if connection_id != self.connection_id {
             return false;
         }
         self.is_conn_exist = false;
@@ -904,7 +931,22 @@ pub fn disconnected(app: &Shared, node_id: i64, connection_id: u64) {
         }
         let armed = {
             let mut states = app.notify.lock().unwrap_or_else(|e| e.into_inner());
-            states.entry(node_id).or_default().disconnect(connection_id, Utc::now())
+            // Read-only, so that a node the hub has never met has no state to
+            // arm: created here it would be a node nobody has seen sending an
+            // offline notification, and the number that arrives with a teardown
+            // is no evidence of a connection -- 0 is what the state of a node
+            // the hub has never met holds. See `agent_ws::FIRST_SESSION`.
+            let Some(state) = states.get_mut(&node_id) else { return };
+            // A teardown is reported once the node's last session has ended, but
+            // it reaches the state only after a settings read, and a reconnect
+            // can overtake it. An arm landing here would name a node that is
+            // reporting again, so what is asked is the node's live entry, which
+            // that reconnect installed before this point; an arm that lands
+            // first is cancelled by the reconnect itself. See `connect`.
+            if app.agents.read().unwrap_or_else(|e| e.into_inner()).contains_key(&node_id) {
+                return;
+            }
+            state.disconnect(connection_id, Utc::now())
         };
         if !armed {
             return;
@@ -914,7 +956,11 @@ pub fn disconnected(app: &Shared, node_id: i64, connection_id: u64) {
         }
         let due = {
             let mut states = app.notify.lock().unwrap_or_else(|e| e.into_inner());
-            states.entry(node_id).or_default().offline_due(connection_id)
+            // Read-only here too: the period this task armed belongs to a state
+            // that exists, and asking for one that does not is not a reason to
+            // create it -- there would be nothing left to send for it either.
+            let Some(state) = states.get_mut(&node_id) else { return };
+            state.offline_due(connection_id)
         };
         if !due {
             return;
@@ -1416,25 +1462,82 @@ mod tests {
         assert!(!state.connect(3), "and it is announced once");
     }
 
-    /// A teardown can arrive after the agent has given up and reconnected; it
-    /// must arm nothing, and above all must not clear the state of the session
-    /// that replaced it -- which would leave a reporting node looking offline.
+    /// A teardown can arrive after the session that owned the grace period has
+    /// been replaced; it must arm nothing more, and above all must not report a
+    /// node that is reporting again. Whether the node is really gone is decided
+    /// where the sessions are counted, not by the number in the report; see
+    /// `agent_ws::release` and the state's own `disconnect`.
     #[test]
-    fn a_stale_teardown_neither_arms_nor_disturbs_the_live_session() {
+    fn a_teardown_arms_once_and_a_replaced_session_keeps_its_period_to_itself() {
         let mut state = NodeState::default();
         state.connect(1);
         state.connect(2);
-        assert!(!state.disconnect(1, at(0)), "the older session no longer holds the node");
-        assert_eq!(state.pending_offline_since, None, "nothing is armed for a session that is gone");
-        assert_eq!(state.connection_id, 2, "and the live session's record is untouched");
-        assert!(state.is_conn_exist);
+        assert!(state.disconnect(2, at(0)), "the teardown the sockets report arms the grace period");
+        assert_eq!(state.connection_id, 2, "recorded as the session the period belongs to");
+        assert_eq!(state.pending_offline_since, Some(at(0)));
+        assert!(state.is_conn_exist, "the node is not marked offline before the period ends");
 
-        // A grace period whose session was replaced while it ran must not mark
-        // the node offline when it expires.
-        assert!(state.disconnect(2, at(1)));
+        // A teardown for the node that arrives while one is already running adds
+        // nothing to it: the deadline stays where the departure set it.
+        assert!(!state.disconnect(1, at(1)), "one period per absence");
+        assert_eq!(state.pending_offline_since, Some(at(0)));
+
+        // A session that took the node over while the period ran: the period is
+        // not this node's outage, and marking it offline would report a node
+        // that has been back for as long as the period was running.
         state.connect(3);
-        assert!(!state.offline_due(2), "the expired grace period belongs to a replaced session");
+        assert!(!state.offline_due(2), "the expired period belongs to a replaced session");
         assert_eq!(state.connection_id, 3);
+    }
+
+    /// A teardown can reach the state while a grace period is already running,
+    /// and the session it names is not the one that period belongs to: the
+    /// socket a node's departure left behind, reporting its own end after the
+    /// fact. It must leave the running period exactly as it found it -- not
+    /// write its own session number into the state, and not arm anything -- or
+    /// the period comes due attributed to a session nobody asks about, and the
+    /// node that is genuinely gone is never reported.
+    #[test]
+    fn a_stale_teardown_leaves_a_running_grace_period_to_the_session_that_armed_it() {
+        let mut state = NodeState::default();
+        state.connect(1);
+        assert!(state.disconnect(1, at(0)), "the departure arms the grace period");
+        assert_eq!(state.connection_id, 1, "attributed to the session that went");
+
+        // The stale teardown: the socket the departure left behind, ending.
+        assert!(!state.disconnect(2, at(1)), "a teardown arriving mid-period arms nothing further");
+        assert_eq!(state.connection_id, 1, "and does not take the period over");
+        assert_eq!(state.pending_offline_since, Some(at(0)), "the deadline stays where the departure set it");
+
+        // Which is what leaves the period collectable by the task that armed it.
+        assert!(state.offline_due(1), "the period still comes due for the session that armed it");
+        assert!(!state.is_conn_exist, "and the node is recorded offline");
+        assert_eq!(state.pending_offline_since, None, "with nothing left pending behind it");
+    }
+
+    /// A period that has been asked about is settled, whatever the answer: the
+    /// node must be able to report again afterwards. A pending instant that
+    /// survives its own grace period would swallow the next connection and stop
+    /// the next departure from arming one, leaving that node silent for good.
+    #[test]
+    fn a_settled_grace_period_leaves_the_node_free_to_report_again() {
+        let mut state = NodeState::default();
+        state.connect(1);
+        assert!(state.disconnect(1, at(0)), "the departure arms the grace period");
+
+        // The question arrives for a session the period is not the absence of,
+        // so there is nothing to send -- and the period is over all the same.
+        assert!(!state.offline_due(2), "a period for another session owes nothing");
+        assert_eq!(state.pending_offline_since, None, "asked about is settled, not left behind");
+
+        // Nothing is held back by it: the state takes the next departure and
+        // reports it the way it reported the first.
+        assert!(!state.connect(3), "the node was never marked offline, so it is not a return");
+        assert!(state.disconnect(3, at(1)), "the next departure arms a period of its own");
+        assert!(state.offline_due(3), "which is announced");
+        assert!(!state.is_conn_exist);
+        assert!(state.connect(4), "and the return from it is announced too");
+        assert!(!state.connect(5), "once");
     }
 
     /// The two paths the sockets call: neither touches the network or the
@@ -1453,20 +1556,66 @@ mod tests {
         assert!(app.notify.lock().unwrap()[&1].pending_offline_since.is_none());
     }
 
-    /// A stale teardown reaching the socket path leaves the live session alone,
-    /// the same way it does inside the state itself.
+    /// A teardown reaches the state only after a settings read, so a reconnect
+    /// can overtake it. The node's live entry is what tells a departure from a
+    /// node that is reporting again: an arm landing for a node that is held arms
+    /// nothing, and one for a node nothing holds starts the period.
     #[tokio::test]
-    async fn a_stale_teardown_on_the_socket_path_leaves_the_live_session_armed_alone() {
+    async fn a_teardown_reaching_the_state_after_a_reconnect_arms_nothing() {
         let app = app();
         app.db.set("notify_enabled", "on").unwrap();
         connected(&app, 1, 10);
-        connected(&app, 1, 11);
+        // The socket the report names is gone, and a new one has taken the node
+        // in the meantime -- which is what the panel sees as online.
+        let (tx, _held) = tokio::sync::mpsc::channel::<String>(1);
+        app.agents.write().unwrap().insert(1, crate::agent_ws::Agent::new(11, tx));
         disconnected(&app, 1, 10);
         // The armed state only exists once the spawned task has run.
         tokio::task::yield_now().await;
-        let states = app.notify.lock().unwrap();
-        assert!(states[&1].pending_offline_since.is_none(), "a teardown from session 10 arms nothing");
-        assert_eq!(states[&1].connection_id, 11);
+        {
+            let states = app.notify.lock().unwrap();
+            assert!(states[&1].pending_offline_since.is_none(), "a node that is held again arms nothing");
+            assert_eq!(states[&1].connection_id, 10, "and the session the state holds is not disturbed");
+        }
+
+        // The departure itself: nothing holds the node, so the period starts.
+        app.agents.write().unwrap().remove(&1);
+        disconnected(&app, 1, 10);
+        tokio::task::yield_now().await;
+        assert!(app.notify.lock().unwrap()[&1].pending_offline_since.is_some());
+    }
+
+    /// A node the hub has never met has no state, and a teardown is no reason to
+    /// give it one: the number that arrives with the report is not evidence that
+    /// anything connected, and a state created here would send an offline
+    /// notification for a node nobody has seen.
+    #[tokio::test]
+    async fn a_teardown_for_a_node_the_hub_never_met_creates_nothing() {
+        let app = app();
+        app.db.set("notify_enabled", "on").unwrap();
+        disconnected(&app, 1, 0);
+        // The session 0 of a state nothing has touched is the case the numbering
+        // exists to rule out; the drawing the hub itself makes is the other.
+        disconnected(&app, 1, crate::agent_ws::next_session());
+        tokio::task::yield_now().await;
+        assert!(
+            app.notify.lock().unwrap().is_empty(),
+            "no state is created for a node that has not connected, so nothing can be sent for it"
+        );
+    }
+
+    /// 0 is what a node the hub has never met holds, so no session the hub hands
+    /// out can equal it: the counter it draws from starts above it.
+    #[test]
+    fn the_never_connected_default_is_below_every_session_number() {
+        assert_eq!(NodeState::default().connection_id, 0, "the state of a node nobody has seen");
+        assert!(
+            NodeState::default().connection_id < crate::agent_ws::FIRST_SESSION,
+            "and the first number handed out is above it"
+        );
+        for _ in 0..3 {
+            assert!(crate::agent_ws::next_session() >= crate::agent_ws::FIRST_SESSION);
+        }
     }
 
     // ---- the panel's routes ----
