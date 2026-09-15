@@ -10,6 +10,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod notify_js;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
