@@ -70,6 +70,52 @@ export function changes<T extends object>(initial: T, values: Partial<T>): Parti
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>
 }
 
+/**
+ * 通知配置里只写不可读的键，和服务端 `notify::SECRETS` 一一对应。
+ *
+ * 面板拿不到密钥原文，只有一个 `<key>_set` 布尔。把空字符串发回去等于把已存
+ * 的密钥清空，而面板根本不知道原来有没有。
+ */
+export const NOTIFY_SECRETS = [
+  "notify_webhook_url",
+  "notify_webhook_password",
+  "notify_telegram_token",
+  "notify_bark_key",
+  "notify_serverchan_key",
+] as const
+
+/**
+ * 「通知」卡片的回传体：服务端 `/api/settings` 给的可读键原样带回（默认值已由
+ * 服务端填好），密钥只在操作者重新输入时带上。
+ *
+ * 单独一个纯函数，是因为这里的每一条默认值都必须和服务端读取时的一致：面板漏
+ * 传一个键，保存就静默地什么也没写；带上一个空字符串，就把已存的密钥清掉了。
+ */
+export function notifyPatch(s: Record<string, string | boolean>): Record<string, string> {
+  const patch: Record<string, string> = {
+    // 两个开关的默认方向不同，和服务端一致：通知默认关（新装一个 hub 不该自己开始
+    // 往外发消息），上线通知默认开。缺键时按默认值走，而不是按「不是 off 就是 on」。
+    notify_enabled: s.notify_enabled === "on" ? "on" : "off",
+    notify_notify_on_online: s.notify_notify_on_online === "off" ? "off" : "on",
+    notify_provider: String(s.notify_provider || "none"),
+    notify_grace_seconds: String(s.notify_grace_seconds || "300"),
+    notify_template: String(s.notify_template ?? ""),
+    notify_webhook_method: String(s.notify_webhook_method || "POST"),
+    notify_webhook_headers: String(s.notify_webhook_headers ?? ""),
+    notify_webhook_username: String(s.notify_webhook_username ?? ""),
+    notify_telegram_chat: String(s.notify_telegram_chat ?? ""),
+    notify_telegram_endpoint: String(s.notify_telegram_endpoint ?? ""),
+    notify_bark_url: String(s.notify_bark_url ?? ""),
+    notify_bark_level: String(s.notify_bark_level ?? ""),
+  }
+  for (const key of NOTIFY_SECRETS) {
+    const value = String(s[key] ?? "")
+    // 只有空白也算没填：操作者把输入框清成空格，不该被当成一把新密钥存进去。
+    if (value.trim()) patch[key] = value
+  }
+  return patch
+}
+
 export const GIB = 1024 ** 3
 
 /**
