@@ -90,8 +90,14 @@ export const NOTIFY_SECRETS = [
  *
  * 单独一个纯函数，是因为这里的每一条默认值都必须和服务端读取时的一致：面板漏
  * 传一个键，保存就静默地什么也没写；带上一个空字符串，就把已存的密钥清掉了。
+ *
+ * `secrets` 是操作者刚敲进输入框的明文，面板在保存成功后清空它——否则下一次
+ * 保存会把上一次存进去的密钥再传一遍，而面板根本不知道它是不是还是那把密钥。
  */
-export function notifyPatch(s: Record<string, string | boolean>): Record<string, string> {
+export function notifyPatch(
+  s: Record<string, string | boolean>,
+  secrets: Record<string, string> = {},
+): Record<string, string> {
   const patch: Record<string, string> = {
     // 两个开关的默认方向不同，和服务端一致：通知默认关（新装一个 hub 不该自己开始
     // 往外发消息），上线通知默认开。缺键时按默认值走，而不是按「不是 off 就是 on」。
@@ -107,9 +113,13 @@ export function notifyPatch(s: Record<string, string | boolean>): Record<string,
     notify_telegram_endpoint: String(s.notify_telegram_endpoint ?? ""),
     notify_bark_url: String(s.notify_bark_url ?? ""),
     notify_bark_level: String(s.notify_bark_level ?? ""),
+    notify_serverchan_endpoint: String(s.notify_serverchan_endpoint ?? ""),
+    // 脚本用 `??` 而不是 `||`：空脚本是操作者的一个选择，服务端拿它当「没配置」，
+    // 面板没有理由把它换成别的东西。
+    notify_javascript_script: String(s.notify_javascript_script ?? ""),
   }
   for (const key of NOTIFY_SECRETS) {
-    const value = String(s[key] ?? "")
+    const value = String(secrets[key] ?? s[key] ?? "")
     // 只有空白也算没填：操作者把输入框清成空格，不该被当成一把新密钥存进去。
     if (value.trim()) patch[key] = value
   }
