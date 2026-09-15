@@ -12,7 +12,7 @@ mod frontend;
 mod notify;
 mod notify_js;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -43,6 +43,15 @@ pub struct App {
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    /// The sessions currently holding each node, each with its outbound channel.
+    /// Two facts in one map: a node is offline once the sessions here are gone,
+    /// and a session whose channel is held here is one whose socket the hub keeps
+    /// open, because dropping the last sender is what ends that session's read
+    /// loop. Both matter -- one token installed on two machines has two sockets,
+    /// and the newer session taking the node's live entry must not hang up on the
+    /// older one, or "the node has gone" would be decided by a socket the hub had
+    /// already thrown away. See `agent_ws::release`.
+    pub agent_sessions: Mutex<HashMap<i64, BTreeMap<u64, tokio::sync::mpsc::Sender<String>>>>,
     /// Per-node notification state: whether a node is inside its offline grace
     /// period, and whether the last change has already been reported. Rebuilt
     /// by a reconnect, hence in memory only. See `notify`.
@@ -69,6 +78,7 @@ impl App {
             db,
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            agent_sessions: Mutex::default(),
             notify: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),

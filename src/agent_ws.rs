@@ -30,7 +30,20 @@ const SILENCE: Duration = Duration::from_secs(120);
 /// remain nominally open for up to SILENCE, long enough for the agent to have
 /// given up and reconnected; without this tag a late teardown would remove the
 /// live session that replaced it.
-static SESSION: AtomicU64 = AtomicU64::new(0);
+///
+/// Numbered from [`FIRST_SESSION`], which is what lets 0 mean "this node has
+/// never connected": that is what a state the hub has not touched holds, and a
+/// session number that could equal it would make a teardown for a node nobody
+/// has seen look like one for a node that has. See [`crate::notify`].
+static SESSION: AtomicU64 = AtomicU64::new(FIRST_SESSION);
+
+/// The number the first session is given. See [`SESSION`].
+pub const FIRST_SESSION: u64 = 1;
+
+/// The number for one more session.
+pub fn next_session() -> u64 {
+    SESSION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One connected agent. Held in memory only, and rebuilt within one report
 /// interval of a hub restart.
@@ -168,11 +181,11 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
-    let session = SESSION.fetch_add(1, Ordering::Relaxed);
+    let session = next_session();
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
+    attach(&app, node_id, session, tx);
     info!("node {node_id} connected from {ip}");
     // Recorded before anything can go wrong with the socket: this is the state
     // that later tells a short reconnect from an outage. See `notify`.
@@ -221,32 +234,102 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e.into()),
                 }
+                // The node's live entry is also what `api` takes away: it
+                // deletes a node, resets a token or restores a database, and it
+                // has no way to reach this socket. One that outlives its entry
+                // reports into nothing, and the frames it keeps sending are what
+                // would stop it from ever going SILENCE-quiet, so it ends here
+                // -- as it did when the entry's own channel was what held the
+                // read loop open.
+                if !live(&app, node_id) {
+                    warn!("node {node_id} is no longer in the live map; ending its session");
+                    break Ok(());
+                }
             }
         }
     };
 
-    if release(&app, node_id, session) {
-        info!("node {node_id} went offline");
-        // The grace period starts here, not at the socket's death: a node that
-        // returns inside it was never off, and the notification is cancelled.
-        // A stale teardown released nothing, so it arms nothing either.
-        crate::notify::disconnected(&app, node_id, session);
-    }
+    // When it returns false another socket still holds the node, or an
+    // operator's action already took its entry away: the node did not go
+    // anywhere, and nothing is announced.
+    departed(&app, node_id, session);
     outcome
 }
 
-/// Drops a node's connection state, but only while `session` is still the one
-/// holding it. Returns whether anything was released.
+/// Registers one session as holding the node, and installs it as the node's live
+/// entry. Both maps move under both locks: a teardown that saw one of them
+/// updated and not the other would report a node offline while a socket was
+/// still reporting for it.
+fn attach(app: &App, node_id: i64, session: u64, tx: mpsc::Sender<String>) {
+    let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+    let mut sessions = app.agent_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    // The session's channel is held here as well as in the node's live entry,
+    // which the next connection replaces. That replacement drops the entry's
+    // sender, and without this second hold the hub would close the socket of the
+    // session it displaced: a dropped sender is what ends a read loop, so a
+    // machine that is still sending reports would leave the panel as if it had
+    // gone away.
+    sessions.entry(node_id).or_default().insert(session, tx.clone());
+    // The entry is the newest session's: the panel and the public page read it
+    // for the node's current figures, and a report from any of the node's
+    // sessions lands in it. See `report`.
+    agents.insert(node_id, Agent::new(session, tx));
+}
+
+/// Drops one session from a node, taking the node's live entry with it once no
+/// session is left. Returns whether the node itself went offline.
 ///
-/// A teardown can arrive up to SILENCE after the agent gave up, by which time a
-/// reconnect may have installed a newer session under the same node id; clearing
-/// that one would mark a node offline while it is reporting normally.
+/// A node can be held by more than one socket -- the same token installed on two
+/// machines, or the reconnect that arrives while the socket it replaces is still
+/// open -- and only the last of them ending means the node is gone. Counted by
+/// session rather than by the single newest one, which is what made a reconnect
+/// look like a departure: the newer session ends first, the older socket is
+/// still reporting, and the node was removed from the panel and reported
+/// offline.
 fn release(app: &App, node_id: i64, session: u64) -> bool {
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    if !agents.get(&node_id).is_some_and(|a| a.session == session) {
+    let mut sessions = app.agent_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(held) = sessions.get_mut(&node_id) else { return false };
+    // Dropping the channel is part of ending the session. A session this node is
+    // not held by was released already, or ended while the node was taken away
+    // from it, and neither says anything about the node.
+    if held.remove(&session).is_none() || !held.is_empty() {
         return false;
     }
-    agents.remove(&node_id);
+    // Dropped rather than left empty: the map is rebuilt by the node's next
+    // connection, and one keeping an entry per node the hub has ever seen grows
+    // with no bound.
+    sessions.remove(&node_id);
+    // An entry that is already gone was dropped by something other than this
+    // session ending: `api` deletes a node, resets its token or restores a
+    // database, and from that moment the node reads offline and the reports of
+    // its sockets are dropped. This teardown is a socket following it out, not
+    // the departure.
+    agents.remove(&node_id).is_some()
+}
+
+/// Whether the node still has a live entry, which is what being online means to
+/// the panel, to the public page and to `report`.
+fn live(app: &App, node_id: i64) -> bool {
+    app.agents.read().unwrap_or_else(|e| e.into_inner()).contains_key(&node_id)
+}
+
+/// Ends one session and, when it was the node's last, reports the node offline.
+/// Returns whether the node itself went offline.
+///
+/// The grace period starts here, not at the socket's death: a node that returns
+/// inside it was never off, and the notification is cancelled. A teardown that
+/// released nothing arms nothing either.
+fn departed(app: &Shared, node_id: i64, session: u64) -> bool {
+    if !release(app, node_id, session) {
+        return false;
+    }
+    info!("node {node_id} went offline");
+    // Reported once both maps have been let go: `notify` reads the live entries
+    // back to tell a node that has gone from one that reconnected while this
+    // report was on its way, and holding either lock here would take the two in
+    // the opposite order.
+    crate::notify::disconnected(app, node_id, session);
     true
 }
 
@@ -467,12 +550,16 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
 /// Pushes the current probe list to every connected agent, so a panel edit takes
 /// effect without waiting for a reconnect.
 pub fn push_ping_tasks(app: &App) {
+    // One message per session rather than per node: a node can be held by more
+    // than one socket, each running its own probes, and the channels held here
+    // are live sessions' -- the node's single live entry keeps the newest
+    // session's channel, which a session that has ended can no longer read from.
     let connected: Vec<(i64, mpsc::Sender<String>)> = app
-        .agents
-        .read()
+        .agent_sessions
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .map(|(id, agent)| (*id, agent.tx.clone()))
+        .flat_map(|(id, sessions)| sessions.values().map(|tx| (*id, tx.clone())))
         .collect();
     for (node_id, sender) in connected {
         // The queue carries only these messages, so a full one indicates an agent
@@ -505,7 +592,7 @@ mod tests {
     fn connect(app: &App) -> (i64, mpsc::Receiver<String>) {
         let id = node(app);
         let (tx, rx) = mpsc::channel(4);
-        app.agents.write().unwrap().insert(id, Agent::new(1, tx));
+        attach(app, id, 1, tx);
         (id, rx)
     }
 
@@ -821,11 +908,11 @@ mod tests {
         let app = app();
         let id = node(&app);
         let live = || app.agents.read().unwrap().contains_key(&id);
-        // release() reads the session tag rather than the channel, so a dropped
+        // release() reads the session tags rather than the channel, so a dropped
         // receiver changes nothing.
         let connect = |session| {
-            let (tx, _) = mpsc::channel(1);
-            app.agents.write().unwrap().insert(id, Agent::new(session, tx));
+            let (tx, _held) = mpsc::channel(1);
+            attach(&app, id, session, tx);
         };
 
         // The ordinary case: the session ending is the one on record.
@@ -840,6 +927,60 @@ mod tests {
         assert!(!release(&app, id, 1), "a stale session must release nothing");
         assert!(live(), "the reconnected agent stays online");
         assert!(app.agents.read().unwrap().contains_key(&id), "and keeps receiving probe pushes");
+    }
+
+    /// Two sockets on one node: the node is offline only once the last of them
+    /// has ended whichever order they end in. The newer one can end first -- the
+    /// socket a reconnect abandoned, released by the kernel while the connection
+    /// it replaced is still reporting -- and taking that for the node's
+    /// departure marked a node that was on the panel, and still sending, offline.
+    #[tokio::test]
+    async fn a_node_held_by_a_second_socket_stays_online_when_that_socket_ends() {
+        let app: Shared = std::sync::Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        // The grace period is what a false departure would arm, so the
+        // notification state has to be watching for those assertions to mean
+        // anything: with notifications off `disconnected` arms nothing at all.
+        app.db.set("notify_enabled", "on").unwrap();
+        let id = node(&app);
+        let online = || app.agents.read().unwrap().contains_key(&id);
+        // The two connections as `serve` makes them: registered, then recorded
+        // by the notification state, which is what a departure is announced
+        // against. The receivers are the sockets: the first one keeps reading
+        // only for as long as its channel has a sender.
+        let connect = |session| {
+            let (tx, held) = mpsc::channel(4);
+            attach(&app, id, session, tx);
+            crate::notify::connected(&app, id, session);
+            held
+        };
+        let mut old = connect(1);
+        let _new = connect(2);
+        assert!(online(), "either socket keeps the node on the panel");
+        // The newer session took the node's live entry over. The socket it
+        // displaced is still a socket: its channel still has a sender, so its
+        // read loop is still waiting rather than ending, and the machine behind
+        // it is still reporting.
+        assert!(
+            matches!(old.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the older session's socket is left open, not hung up on"
+        );
+
+        assert!(!departed(&app, id, 2), "the newer session ending is not the node going offline");
+        // The report is spawned rather than made here, so it needs a turn.
+        tokio::task::yield_now().await;
+        assert!(online(), "the node stays on the panel: the socket it replaced is still reporting");
+        assert!(
+            app.notify.lock().unwrap()[&id].pending_offline_since.is_none(),
+            "and no grace period is armed, so no offline notification can follow"
+        );
+
+        assert!(departed(&app, id, 1), "the last session ending is the node going offline");
+        tokio::task::yield_now().await;
+        assert!(!online(), "the node left the panel once nothing held it");
+        assert!(
+            app.notify.lock().unwrap()[&id].pending_offline_since.is_some(),
+            "and exactly one grace period was armed for the node"
+        );
     }
 
     #[test]
