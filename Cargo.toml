@@ -31,11 +31,24 @@ tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# The JavaScript notification channel. Pure Rust, like the two above, and the
-# same `FROM scratch` constraint rules out the Node compatibility layer komari
-# builds on goja_nodejs. Default features off: `temporal` and `intl` would pull
-# in the ICU data crates for two globals a notification script has no use for.
-boa_engine = { version = "0.22.0", default-features = false }
+# The JavaScript notification channel. QuickJS through rquickjs: a C library
+# built from the sources vendored in `rquickjs-sys`, which the `cc` crate
+# compiles with the C toolchain `cross` already carries. Default features off
+# as a matter of form rather than of today's defaults -- they are empty -- so
+# that nobody can turn on `bindgen` by accident: the release build runs under
+# `cross` in a musl container that has no libclang, and the bindings that ship
+# pre-generated are the whole reason the C dependency crosses over.
+rquickjs = { version = "0.9", default-features = false }
+# Encodings and digests for the script's `Buffer` and `crypto`. Both are
+# already compiled for this binary -- axum pulls base64 and sha1 -- so naming
+# them here adds no package to the lock, only an edge to a crate that is
+# present anyway.
+base64 = "0.22"
+sha1 = "0.10"
+# `os.hostname()`. The release image is `FROM scratch`, so there is no
+# `/etc/hostname` to read and no `hostname(1)` to run; libc is already compiled
+# for this binary through tokio, so the syscall is the cheap way to the answer.
+libc = "0.2"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
